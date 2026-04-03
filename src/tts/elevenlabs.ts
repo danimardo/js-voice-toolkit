@@ -134,6 +134,138 @@ export async function textToSpeechStream(
   return response.body;
 }
 
+// ─── WebSocket streaming (tiempo real) ───────────────────────────────────────
+
+export interface ElevenLabsWSOptions extends Omit<ElevenLabsTTSOptions, 'stream'> {
+  /**
+   * Fragmentos de texto a sintetizar en tiempo real.
+   * Puede ser un array de strings o un AsyncIterable (ej: stream de un LLM).
+   */
+  textChunks: AsyncIterable<string> | string[];
+}
+
+/**
+ * Convierte fragmentos de texto en audio en tiempo real usando la API WebSocket
+ * de ElevenLabs (`/stream-input`). Permite empezar a reproducir audio mientras
+ * aún se están enviando fragmentos de texto (mínima latencia).
+ *
+ * Devuelve un `ReadableStream<Uint8Array>` con los chunks de audio MP3.
+ *
+ * IMPORTANTE: Solo funciona en entornos con soporte WebSocket (navegador o Node ≥ 18).
+ *
+ * @example
+ * const stream = textToSpeechWebSocketStream({
+ *   apiKey: 'tu-key',
+ *   textChunks: ['Hola, ', 'esto es ', 'tiempo real.'],
+ * });
+ * // Usar el ReadableStream con MediaSource API para reproducción progresiva
+ */
+export function textToSpeechWebSocketStream(
+  options: ElevenLabsWSOptions
+): ReadableStream<Uint8Array> {
+  const {
+    apiKey,
+    voiceId = ELEVENLABS_VOICES.CHARLOTTE,
+    modelId = 'eleven_multilingual_v2',
+    stability = 0.5,
+    similarityBoost = 0.75,
+    textChunks,
+  } = options;
+
+  const wsUrl =
+    `wss://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream-input` +
+    `?model_id=${modelId}&output_format=mp3_44100_128`;
+
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      const ws = new WebSocket(wsUrl);
+
+      ws.onopen = () => {
+        // Primer mensaje: inicialización con API key y ajustes de voz
+        ws.send(JSON.stringify({
+          text: ' ',
+          voice_settings: {
+            stability,
+            similarity_boost: similarityBoost,
+            use_speaker_boost: true,
+          },
+          xi_api_key: apiKey,
+        }));
+
+        // Enviar fragmentos de texto y señal de fin
+        (async () => {
+          for await (const chunk of textChunks) {
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ text: chunk, try_trigger_generation: true }));
+            }
+          }
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ text: '' })); // fin del stream de texto
+          }
+        })().catch((e) => controller.error(e));
+      };
+
+      ws.onmessage = (event) => {
+        // Los mensajes pueden llegar como ArrayBuffer (binario) o JSON con audio en base64
+        if (event.data instanceof ArrayBuffer) {
+          controller.enqueue(new Uint8Array(event.data));
+          return;
+        }
+
+        if (typeof event.data === 'string') {
+          try {
+            const msg = JSON.parse(event.data) as {
+              audio?: string;
+              isFinal?: boolean;
+              message?: string;
+            };
+
+            if (msg.audio) {
+              const binary = atob(msg.audio);
+              const bytes = new Uint8Array(binary.length);
+              for (let i = 0; i < binary.length; i++) {
+                bytes[i] = binary.charCodeAt(i);
+              }
+              controller.enqueue(bytes);
+            }
+
+            if (msg.isFinal) {
+              ws.close();
+              try { controller.close(); } catch { /* ya cerrado */ }
+            }
+
+            if (msg.message) {
+              // ElevenLabs puede enviar mensajes de error en JSON
+              controller.error(new Error(`ElevenLabs WS: ${msg.message}`));
+              ws.close();
+            }
+          } catch {
+            // mensaje no JSON — ignorar
+          }
+        }
+      };
+
+      ws.onerror = () => {
+        controller.error(new Error('ElevenLabs WebSocket: error de conexión'));
+      };
+
+      ws.onclose = (event) => {
+        if (!event.wasClean && event.code !== 1000) {
+          try {
+            controller.error(new Error(`ElevenLabs WebSocket cerrado inesperadamente (${event.code})`));
+          } catch { /* stream ya cerrado */ }
+        } else {
+          try { controller.close(); } catch { /* stream ya cerrado */ }
+        }
+      };
+    },
+
+    cancel() {
+      // El stream fue cancelado por el consumidor — nada más que hacer
+    },
+  });
+}
+
 /**
  * Obtiene la lista de voces disponibles en la cuenta.
  */

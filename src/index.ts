@@ -2,6 +2,7 @@
 export {
   textToSpeech,
   textToSpeechStream,
+  textToSpeechWebSocketStream,
   listVoices,
   playAudioBlob,
   ELEVENLABS_VOICES,
@@ -10,6 +11,7 @@ export {
 export type {
   ElevenLabsTTSOptions,
   ElevenLabsVoice,
+  ElevenLabsWSOptions,
 } from './tts/elevenlabs.js';
 
 // ─── STT: Voz → Texto (batch) ─────────────────────────────────────────────────
