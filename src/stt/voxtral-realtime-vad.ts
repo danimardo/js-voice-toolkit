@@ -33,6 +33,11 @@ const OPEN_CONNECTOR_RE =
 // Signos de puntuación de cierre
 const CLOSED_ENDING_RE = /[.!?¡¿]\s*$/;
 
+// Adjetivos/determinantes al final de frase que anticipan un sustantivo o número pendiente.
+// Ej: "correos de las últimas" → el usuario aún no ha dicho "24 horas".
+const HANGING_ADJECTIVE_RE =
+  /\b(últimas?|primeras?|próximas?|pasadas?|siguientes?|anteriores?|recientes?|nuevas?|viejas?|importantes?|urgentes?|pendientes?|no leídos?|leídos?|enviados?|recibidos?)\s*$/i;
+
 // ─── Tipos públicos ───────────────────────────────────────────────────────────
 
 export interface RealtimeSTTVADOptions {
@@ -139,7 +144,10 @@ function classifyTurnEnd(text: string, hesitationPhrases: string[]): TurnClassif
   // 3. Comprobar puntuación de cierre (Voxtral Realtime ya añade puntuación)
   if (CLOSED_ENDING_RE.test(trimmed)) return 'close';
 
-  // 4. Ambiguo → tratar como cierre (el timer base ya sirve de buffer)
+  // 4. Adjetivo/determinante colgante que espera un sustantivo o número
+  if (HANGING_ADJECTIVE_RE.test(lower)) return 'hesitate';
+
+  // 5. Ambiguo → tratar como cierre (el timer base ya sirve de buffer)
   return 'close';
 }
 
