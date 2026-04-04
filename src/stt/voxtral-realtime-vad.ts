@@ -207,6 +207,7 @@ export async function transcribeLiveRealtimeVAD(
   let active = true;
   let turnText = '';          // texto acumulado del turno actual
   let ignoreDeltas = false;   // true durante un breve período post-onTurnEnd
+  let pendingTurnEnd = false; // true si el timer disparó pero turnText estaba vacío (latencia Mistral)
 
   // ─── Estado VAD ────────────────────────────────────────────────────────────
   let voiceActive = false;
@@ -244,9 +245,17 @@ export async function transcribeLiveRealtimeVAD(
 
   function fireTurnEnd(): void {
     cancelSilenceTimer();
+    if (!active) return;
     const text = turnText.trim();
-    if (!text || !active) return;
 
+    if (!text) {
+      // La transcripción de Mistral aún no ha llegado (latencia de red).
+      // Marcar como pendiente: se disparará al recibir el primer delta.
+      pendingTurnEnd = true;
+      return;
+    }
+
+    pendingTurnEnd = false;
     // Breve ventana de ignorado para descartar deltas tardíos de Voxtral
     ignoreDeltas = true;
     turnText = '';
@@ -283,6 +292,7 @@ export async function transcribeLiveRealtimeVAD(
       if (!voiceActive) {
         voiceActive = true;
         speechStartTime = Date.now();
+        pendingTurnEnd = false; // El usuario volvió a hablar antes de recibir la transcripción
         onVoiceStart?.();
       }
       // Cancelar timer de silencio: el usuario sigue hablando
@@ -334,6 +344,12 @@ export async function transcribeLiveRealtimeVAD(
       if (!ignoreDeltas) {
         turnText += data.text;
         onTranscript(data.text, turnText);
+
+        // El timer disparó cuando turnText estaba vacío (latencia Mistral).
+        // Ahora que llegó texto y el VAD confirma silencio, disparar de inmediato.
+        if (pendingTurnEnd && !voiceActive && silenceTimer === null) {
+          fireTurnEnd();
+        }
       }
     } else if (data.type === 'done') {
       // Segmento completado en Voxtral — la lógica de turno la gestiona el VAD
