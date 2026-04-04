@@ -211,8 +211,14 @@ export async function transcribeLiveRealtimeVAD(
 
   // ─── Estado VAD ────────────────────────────────────────────────────────────
   let voiceActive = false;
-  let speechStartTime = 0;
+  let firstSpeechTime = 0;         // Inicio de la sesión de voz actual (no se resetea por ruido)
+  let consecutiveVoiceChunks = 0;  // Chunks de voz consecutivos para confirmar habla real
   let silenceTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // Chunks consecutivos de voz necesarios para confirmar habla real.
+  // 2 chunks × ~128ms = ~256ms. Evita que picos breves de ruido ambiente
+  // cancelen el timer de silencio o disparen onVoiceStart erróneamente.
+  const VOICE_CONFIRM_CHUNKS = 2;
 
   const handleError = (err: Error): void => {
     if (onError) onError(err);
@@ -256,6 +262,8 @@ export async function transcribeLiveRealtimeVAD(
     }
 
     pendingTurnEnd = false;
+    firstSpeechTime = 0;       // Reiniciar para el siguiente turno
+    consecutiveVoiceChunks = 0;
     // Breve ventana de ignorado para descartar deltas tardíos de Voxtral
     ignoreDeltas = true;
     turnText = '';
@@ -288,29 +296,32 @@ export async function transcribeLiveRealtimeVAD(
     const rms = calculateRMS(chunk);
 
     if (rms >= vadEnergyThreshold) {
-      // ── Voz detectada ──
-      if (!voiceActive) {
+      // ── Energía de voz detectada ──
+      consecutiveVoiceChunks++;
+
+      if (!voiceActive && consecutiveVoiceChunks >= VOICE_CONFIRM_CHUNKS) {
+        // Solo se confirma habla real tras N chunks consecutivos.
+        // Evita que un pico de ruido aislado active el VAD o cancele el timer.
         voiceActive = true;
-        speechStartTime = Date.now();
+        if (firstSpeechTime === 0) firstSpeechTime = Date.now();
         pendingTurnEnd = false; // El usuario volvió a hablar antes de recibir la transcripción
+        cancelSilenceTimer();   // Habla real confirmada → cancelar timer de silencio
         onVoiceStart?.();
-      }
-      // Cancelar timer de silencio: el usuario sigue hablando
-      if (silenceTimer !== null) {
-        cancelSilenceTimer();
       }
     } else {
       // ── Silencio detectado ──
+      consecutiveVoiceChunks = 0;
+
       if (voiceActive) {
         voiceActive = false;
-        const speechDuration = Date.now() - speechStartTime;
+        const speechDuration = Date.now() - firstSpeechTime;
 
         if (speechDuration >= minSpeechMs) {
-          // Suficiente habla → activar timer de fin de turno
+          // Suficiente habla acumulada → activar timer de fin de turno
           onVoicePause?.();
           scheduleSilenceTimer(false);
         }
-        // Si la voz fue demasiado corta (tos, clic) → ignorar
+        // Si la voz fue demasiado corta → ignorar (firstSpeechTime se mantiene para el siguiente chunk)
       }
     }
   }
