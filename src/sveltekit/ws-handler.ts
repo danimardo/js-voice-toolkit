@@ -175,12 +175,23 @@ export function handleVoxtralWsConnection(
                 await audioTask;
               } catch (err) {
                 const message = err instanceof Error ? err.message : 'Error desconocido';
+                console.error('[js-voice-toolkit] Error en sesión Mistral:', message);
                 sendJson({ type: 'error', message });
               } finally {
-                if (connection && !connection.isClosed) {
-                  await connection.close();
+                try {
+                  if (connection && !connection.isClosed) {
+                    await connection.close();
+                  }
+                } catch {
+                  // Ignorar errores al cerrar la conexión Mistral
                 }
-                ws.close();
+                try {
+                  if (ws.readyState === ws.OPEN || ws.readyState === ws.CONNECTING) {
+                    ws.close();
+                  }
+                } catch {
+                  // Ignorar errores al cerrar el WebSocket cliente
+                }
               }
             })();
           }
