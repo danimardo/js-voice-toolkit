@@ -45,3 +45,12 @@ export type {
   RealtimeSTTOptions,
   RealtimeSTTSession,
 } from './stt/voxtral-realtime-client.js';
+
+// ─── STT: Voz → Texto (tiempo real + VAD, navegador) ─────────────────────────
+export {
+  transcribeLiveRealtimeVAD,
+} from './stt/voxtral-realtime-vad.js';
+
+export type {
+  RealtimeSTTVADOptions,
+} from './stt/voxtral-realtime-vad.js';

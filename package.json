@@ -1,6 +1,6 @@
 {
   "name": "js-voice-toolkit",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Librería para TTS (ElevenLabs) y STT en tiempo real y batch (Mistral Voxtral)",
   "type": "module",
   "main": "./dist/index.cjs",

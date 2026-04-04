@@ -6,7 +6,7 @@
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.0-blue)](https://www.typescriptlang.org/)
 [![GitHub](https://img.shields.io/badge/source-github-black)](https://github.com/danimardo/js-voice-toolkit)
 
-> **Versión actual**: 0.2.0 — STT tiempo real con Mistral Voxtral Realtime API
+> **Versión actual**: 0.3.0 — STT tiempo real con VAD y detección automática de fin de turno
 
 ## Índice
 
@@ -18,6 +18,7 @@
   - [STT Batch](#stt-batch)
   - [STT Streaming por Chunks](#stt-streaming-por-chunks)
   - [STT Tiempo Real (Voxtral Realtime)](#stt-tiempo-real-voxtral-realtime)
+  - [STT Tiempo Real con VAD (auto-submit)](#stt-tiempo-real-con-vad-auto-submit)
 - [Integración SvelteKit](#integración-sveltekit)
   - [Desarrollo (Vite plugin)](#desarrollo-vite-plugin)
   - [Producción (servidor personalizado)](#producción-servidor-personalizado)
@@ -39,11 +40,12 @@
 
 ### Speech-to-Text (Mistral Voxtral)
 
-| Modo | Función | Latencia | Requisitos |
-|------|---------|----------|-----------|
-| Batch | `transcribeAudio` | Alta | Solo servidor o cliente con API key |
-| Streaming chunks | `transcribeLive` | Media (~3s) | Solo navegador |
-| **Tiempo real** | `transcribeLiveRealtime` | **Baja (~500ms)** | Navegador + servidor WebSocket |
+| Modo | Función | Latencia | Auto-submit | Requisitos |
+|------|---------|----------|-------------|-----------|
+| Batch | `transcribeAudio` | Alta | No | Servidor o cliente con API key |
+| Streaming chunks | `transcribeLive` | Media (~3s) | No | Solo navegador |
+| Tiempo real | `transcribeLiveRealtime` | Baja (~500ms) | No | Navegador + servidor WebSocket |
+| **Tiempo real + VAD** | `transcribeLiveRealtimeVAD` | **Baja (~500ms)** | **Sí** | **Navegador + servidor WebSocket** |
 
 ### Características Técnicas
 - **Subpath agnóstico** (`js-voice-toolkit`): TTS + STT batch + STT chunks. Funciona en Vanilla JS, React, Vue, Svelte, Node.js.
@@ -172,6 +174,78 @@ const session = await transcribeLiveRealtime({
 session.stop();
 console.log('Transcripción final:', session.getAccumulated());
 ```
+
+---
+
+### STT Tiempo Real con VAD (auto-submit)
+
+Combina transcripción en tiempo real con **detección automática de fin de turno**:
+VAD por energía RMS + timer de silencio + capa semántica rule-based.
+
+Requiere el mismo servidor WebSocket que `transcribeLiveRealtime` (ver [Integración SvelteKit](#integración-sveltekit)).
+
+```typescript
+import { transcribeLiveRealtimeVAD, VOXTRAL_WS_PATH } from 'js-voice-toolkit';
+
+// ⚠️ Llamar desde un gesto de usuario (click)
+const session = await transcribeLiveRealtimeVAD({
+  wsUrl: `ws://${window.location.host}${VOXTRAL_WS_PATH}`,
+  language: 'es',
+
+  // Callbacks principales
+  onTranscript: (delta, turnText) => {
+    // turnText es el texto acumulado del turno actual
+    // Se reinicia automáticamente tras cada onTurnEnd
+    inputField.value = turnText;
+  },
+  onTurnEnd: (finalText) => {
+    // El usuario terminó de hablar → hacer algo con el texto
+    sendToAI(finalText);
+    inputField.value = '';
+  },
+
+  // Callbacks de estado (opcionales)
+  onStart: () => { micButton.classList.add('recording'); },
+  onStop: () => { micButton.classList.remove('recording'); },
+  onVoiceStart: () => { console.log('Voz detectada'); },
+  onVoicePause: () => { console.log('Silencio — esperando...'); },
+  onError: (err) => { console.error(err); },
+});
+
+// Detener (toggle del botón de micrófono)
+session.stop();
+```
+
+**Cómo funciona el VAD internamente:**
+
+```
+Audio PCM (128ms chunks a 16kHz)
+    │
+    ├─ RMS ≥ umbral → VOZ detectada
+    │     └─ Cancelar timer de silencio si hay uno pendiente
+    │
+    └─ RMS < umbral → SILENCIO
+          └─ Si venía de VOZ y duró ≥ minSpeechMs (300ms):
+                └─ Arrancar timer de silencio (700ms por defecto)
+                      └─ Al expirar → análisis semántico:
+                            ├─ Frase cerrada (.!?)     → onTurnEnd inmediato
+                            ├─ Duda (eh, mmm, y...)    → extender 1500ms más
+                            └─ Ambiguo                 → onTurnEnd con timer base
+```
+
+**Opciones configurables del VAD:**
+
+| Opción | Por defecto | Descripción |
+|--------|------------|-------------|
+| `vadEnergyThreshold` | `0.01` | Umbral RMS. Bajar si el micrófono es lejano. |
+| `silenceThresholdMs` | `700` | Ms de silencio antes de evaluar el fin de turno. |
+| `silenceExtensionMs` | `1500` | Ms extra de espera si se detecta duda semántica. |
+| `minSpeechMs` | `300` | Ms mínimos de voz para activar el timer. |
+| `hesitationPhrases` | `['eh','mmm','o sea',...]` | Lista personalizable de palabras de duda. |
+
+**La sesión es multi-turno**: el micrófono y el WebSocket permanecen abiertos entre turnos.
+Cada `onTurnEnd` reinicia el acumulador automáticamente. Llama a `session.stop()` cuando
+quieras desactivar el modo voz completamente.
 
 ---
 
@@ -363,10 +437,36 @@ Requiere un servidor WebSocket compatible (ver addon `/sveltekit`).
 - `getAccumulated()` — texto acumulado
 - `isActive: boolean` — estado actual
 
+#### `transcribeLiveRealtimeVAD(options)` → `Promise<RealtimeSTTSession>`
+
+Igual que `transcribeLiveRealtime` pero con detección automática de fin de turno. La sesión es **multi-turno**: permanece activa entre turnos hasta llamar `session.stop()`.
+
+| Parámetro | Tipo | Por defecto | Descripción |
+|-----------|------|-------------|-------------|
+| `options.wsUrl` | `string` | — | URL del WebSocket del servidor |
+| `options.language` | `string?` | auto | BCP-47 |
+| `options.vadEnergyThreshold` | `number?` | `0.01` | Umbral RMS para detectar voz |
+| `options.silenceThresholdMs` | `number?` | `700` | Ms de silencio para evaluar fin de turno |
+| `options.silenceExtensionMs` | `number?` | `1500` | Ms extra si se detecta duda semántica |
+| `options.minSpeechMs` | `number?` | `300` | Ms mínimos de voz antes de activar VAD |
+| `options.hesitationPhrases` | `string[]?` | lista predefinida | Palabras de duda que extienden el timer |
+| `options.onTranscript` | `(delta, turnText) => void` | — | **Requerido.** Delta y texto del turno |
+| `options.onTurnEnd` | `(finalText) => void` | — | **Requerido.** Fin de turno detectado |
+| `options.onStart` | `() => void` | — | Servidor listo, mic activo |
+| `options.onStop` | `() => void` | — | Sesión detenida |
+| `options.onVoiceStart` | `() => void` | — | VAD detectó inicio de voz |
+| `options.onVoicePause` | `() => void` | — | VAD detectó inicio de silencio |
+| `options.onError` | `(error) => void` | — | Error |
+
+**Retorna** `RealtimeSTTSession` (mismo tipo que `transcribeLiveRealtime`):
+- `stop()` — detiene sesión completamente
+- `getAccumulated()` — texto del turno actual
+- `isActive: boolean`
+
 #### `MicrophoneCapture`
 
 Clase para captura de audio PCM 16-bit mono a 16kHz. Usada internamente por
-`transcribeLiveRealtime`, pero exportada para integraciones personalizadas.
+`transcribeLiveRealtime` y `transcribeLiveRealtimeVAD`, exportada para integraciones personalizadas.
 
 ```typescript
 // Solicitar stream (dentro de gesto de usuario)
