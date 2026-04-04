@@ -228,6 +228,16 @@ export async function transcribeLiveRealtimeVAD(
   // cancelen el timer de silencio o disparen onVoiceStart erróneamente.
   const VOICE_CONFIRM_CHUNKS = 2;
 
+  // ─── Calibración automática de ruido ambiente ─────────────────────────────
+  // Los primeros CALIB_CHUNKS (~2 segundos) se usan para medir el nivel de
+  // ruido real del micro. El umbral efectivo se fija en max(configurado, 3×ruido)
+  // para adaptarse automáticamente a distintos entornos.
+  let calibrating = true;
+  let calibChunkCount = 0;
+  let calibRmsSum = 0;
+  const CALIB_CHUNKS = 15; // 15 × 128ms ≈ 2 segundos
+  let effectiveThreshold = vadEnergyThreshold;
+
   const handleError = (err: Error): void => {
     if (onError) onError(err);
     else console.error('[js-voice-toolkit] Error VAD STT:', err);
@@ -303,7 +313,26 @@ export async function transcribeLiveRealtimeVAD(
   function processAudioChunk(chunk: Int16Array): void {
     const rms = calculateRMS(chunk);
 
-    if (rms >= vadEnergyThreshold) {
+    // ── Fase de calibración inicial ───────────────────────────────────────────
+    // Durante los primeros ~2 segundos se mide el ruido ambiente sin activar el VAD.
+    if (calibrating) {
+      calibChunkCount++;
+      calibRmsSum += rms;
+      if (calibChunkCount >= CALIB_CHUNKS) {
+        calibrating = false;
+        const noiseFloor = calibRmsSum / calibChunkCount;
+        // Umbral efectivo = max(umbral configurado, 3× ruido ambiente medido).
+        // El factor 3 garantiza que la voz (que suele ser 5-10× el ruido) active el VAD
+        // sin que el propio ruido lo dispare.
+        effectiveThreshold = Math.max(vadEnergyThreshold, noiseFloor * 3);
+        console.debug(
+          `[VAD] Calibración completada — ruido ambiente: ${noiseFloor.toFixed(4)}, umbral ajustado: ${effectiveThreshold.toFixed(4)}`
+        );
+      }
+      return; // No procesar VAD durante la calibración
+    }
+
+    if (rms >= effectiveThreshold) {
       // ── Energía de voz detectada ──
       consecutiveVoiceChunks++;
 
