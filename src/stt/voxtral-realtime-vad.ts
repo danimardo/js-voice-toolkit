@@ -228,14 +228,15 @@ export async function transcribeLiveRealtimeVAD(
   // cancelen el timer de silencio o disparen onVoiceStart erróneamente.
   const VOICE_CONFIRM_CHUNKS = 2;
 
-  // ─── Calibración automática de ruido ambiente ─────────────────────────────
-  // Los primeros CALIB_CHUNKS (~2 segundos) se usan para medir el nivel de
-  // ruido real del micro. El umbral efectivo se fija en max(configurado, 3×ruido)
-  // para adaptarse automáticamente a distintos entornos.
-  let calibrating = true;
+  // ─── Calibración automática de ruido ambiente (en paralelo con el VAD) ──────
+  // Rastrea el mínimo RMS visto en los primeros CALIB_CHUNKS chunks. Después
+  // de ese período, ajusta effectiveThreshold = max(configurado, mínimo × 3).
+  // Corre en paralelo: el VAD está activo desde el primer chunk con el umbral
+  // configurado, y se refina automáticamente una vez completada la calibración.
+  let calibrationDone = false;
   let calibChunkCount = 0;
-  let calibRmsSum = 0;
-  const CALIB_CHUNKS = 15; // 15 × 128ms ≈ 2 segundos
+  let calibRmsMin = Infinity;
+  const CALIB_CHUNKS = 30; // 30 × 128ms ≈ 4 segundos
   let effectiveThreshold = vadEnergyThreshold;
 
   const handleError = (err: Error): void => {
@@ -313,23 +314,23 @@ export async function transcribeLiveRealtimeVAD(
   function processAudioChunk(chunk: Int16Array): void {
     const rms = calculateRMS(chunk);
 
-    // ── Fase de calibración inicial ───────────────────────────────────────────
-    // Durante los primeros ~2 segundos se mide el ruido ambiente sin activar el VAD.
-    if (calibrating) {
+    // ── Calibración en paralelo (no bloquea el VAD) ───────────────────────────
+    // Rastrea el mínimo RMS durante los primeros ~4 segundos. El mínimo es
+    // una buena aproximación del suelo de ruido: incluso si el usuario habla,
+    // las pausas inter-silábicas y entre palabras dan valores cercanos al ruido real.
+    if (!calibrationDone) {
       calibChunkCount++;
-      calibRmsSum += rms;
+      if (rms < calibRmsMin) calibRmsMin = rms;
       if (calibChunkCount >= CALIB_CHUNKS) {
-        calibrating = false;
-        const noiseFloor = calibRmsSum / calibChunkCount;
-        // Umbral efectivo = max(umbral configurado, 3× ruido ambiente medido).
-        // El factor 3 garantiza que la voz (que suele ser 5-10× el ruido) active el VAD
-        // sin que el propio ruido lo dispare.
-        effectiveThreshold = Math.max(vadEnergyThreshold, noiseFloor * 3);
-        console.debug(
-          `[VAD] Calibración completada — ruido ambiente: ${noiseFloor.toFixed(4)}, umbral ajustado: ${effectiveThreshold.toFixed(4)}`
-        );
+        calibrationDone = true;
+        const newThreshold = Math.max(vadEnergyThreshold, calibRmsMin * 3);
+        if (newThreshold > effectiveThreshold) {
+          effectiveThreshold = newThreshold;
+          console.debug(
+            `[VAD] Calibración — mínimo RMS: ${calibRmsMin.toFixed(4)}, umbral ajustado: ${effectiveThreshold.toFixed(4)}`
+          );
+        }
       }
-      return; // No procesar VAD durante la calibración
     }
 
     if (rms >= effectiveThreshold) {
