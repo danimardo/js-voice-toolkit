@@ -22,6 +22,8 @@
 - [Integración SvelteKit](#integración-sveltekit)
   - [Desarrollo (Vite plugin)](#desarrollo-vite-plugin)
   - [Producción (servidor personalizado)](#producción-servidor-personalizado)
+- [Patrones de Integración](#patrones-de-integración)
+  - [Muletillas de voz mientras procesa](#muletillas-de-voz-mientras-procesa)
 - [Referencia de API](#referencia-de-api)
 - [Ejemplos Completos](#ejemplos-completos)
 - [Buenas Prácticas](#buenas-prácticas)
@@ -317,6 +319,118 @@ Actualiza los scripts de `package.json`:
 
 El WebSocket estará en el mismo puerto y host que la app:
 `wss://tu-dominio.com/ws/stt-realtime`
+
+---
+
+## Patrones de Integración
+
+### Muletillas de voz mientras procesa
+
+Un patrón útil en asistentes por voz es reproducir una **muletilla corta**
+("ajá", "ok", "bien", "te entiendo") justo después de detectar el fin de turno
+del usuario, mientras la app envía el texto al LLM y espera la respuesta real.
+
+Esto **no forma parte del runtime base de `js-voice-toolkit`** como API cerrada,
+pero encaja muy bien con la combinación:
+
+- `transcribeLiveRealtimeVAD(...)` para detectar el fin de turno
+- tu propio flujo de `sendMessage(...)` / Vercel AI SDK
+- tu propia capa de TTS/cache para muletillas
+- barge-in: cortar inmediatamente la muletilla si el usuario vuelve a hablar
+
+**Recomendación de arquitectura:**
+
+- Usa `js-voice-toolkit` para STT en tiempo real, VAD, TTS y barge-in.
+- Implementa en tu aplicación la lógica de producto:
+  - lista de muletillas configurable por `.env`
+  - generación de audios faltantes al arrancar
+  - caché en disco (`static/` o carpeta pública equivalente)
+  - reproducción aleatoria de una muletilla tras cada `onTurnEnd`
+
+**Por qué así:**
+
+- La parte reusable es el runtime de voz.
+- La parte específica de producto depende de tu framework, tu servidor,
+  tu estrategia de caché y tus variables de entorno.
+- Así puedes reutilizar `js-voice-toolkit` en futuras apps sin acoplarla
+  a un único modelo de despliegue.
+
+#### Flujo recomendado
+
+```text
+Usuario habla
+  → transcribeLiveRealtimeVAD detecta onTurnEnd(finalText)
+  → la app envía finalText al chat / LLM
+  → la app reproduce una muletilla aleatoria ya cacheada
+  → si el usuario vuelve a hablar: barge-in y stop inmediato
+  → cuando llega la respuesta real del asistente: detener muletilla y reproducir TTS normal
+```
+
+#### Variables `.env` sugeridas
+
+```env
+# Activar/desactivar muletillas
+AI_FILLER_ENABLED=true
+
+# Lista de textos. Separador recomendado: |
+AI_FILLER_PHRASES=Ajá.|Ok.|Bien.|Te entiendo.
+
+# Carpeta pública para cachear los audios generados
+AI_FILLER_DIR=generated/fillers
+
+# Voz específica opcional para las muletillas
+AI_FILLER_VOICE_ID=
+```
+
+#### Ejemplo de integración cliente
+
+```typescript
+import { transcribeLiveRealtimeVAD, VOXTRAL_WS_PATH } from 'js-voice-toolkit';
+
+const fillerClips = [
+  '/generated/fillers/aja.mp3',
+  '/generated/fillers/ok.mp3',
+  '/generated/fillers/bien.mp3',
+];
+
+function playRandomFiller(): void {
+  const clip = fillerClips[Math.floor(Math.random() * fillerClips.length)];
+  const audio = new Audio(clip);
+  audio.play().catch(() => {});
+}
+
+const session = await transcribeLiveRealtimeVAD({
+  wsUrl: `ws://${window.location.host}${VOXTRAL_WS_PATH}`,
+  language: 'es',
+  onTranscript: (_, turnText) => {
+    input = turnText;
+    stopAllAudio(); // barge-in si reaparece voz o texto nuevo
+  },
+  onTurnEnd: async (finalText) => {
+    const sendPromise = chat.sendMessage({ text: finalText });
+    playRandomFiller();
+    await sendPromise;
+  },
+  onVoiceStart: () => {
+    stopAllAudio(); // cortar muletilla o TTS actual
+  },
+});
+```
+
+#### Ejemplo de generación/cache en servidor
+
+La librería no obliga a una implementación concreta. Un enfoque típico es:
+
+1. Leer `AI_FILLER_ENABLED` y `AI_FILLER_PHRASES` al arrancar.
+2. Para cada frase, comprobar si existe un MP3 cacheado.
+3. Si no existe, generarlo con ElevenLabs y guardarlo en `static/generated/fillers`.
+4. Exponer al cliente un endpoint con la lista de URLs disponibles.
+
+Esto permite:
+
+- reproducir la muletilla sin llamar a ElevenLabs en cada turno
+- controlar activación/desactivación por entorno
+- reutilizar la misma estrategia en varias apps construidas sobre `js-voice-toolkit`
 
 ---
 

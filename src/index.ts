@@ -37,6 +37,7 @@ export type {
 
 // ─── STT: Voz → Texto (tiempo real vía WebSocket, navegador) ─────────────────
 export {
+  VOXTRAL_WS_PATH,
   MicrophoneCapture,
   transcribeLiveRealtime,
 } from './stt/voxtral-realtime-client.js';

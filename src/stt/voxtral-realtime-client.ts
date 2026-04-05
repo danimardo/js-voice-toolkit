@@ -9,6 +9,11 @@
 //   - attachVoxtralWsServer de js-voice-toolkit/sveltekit (producción)
 //   - Cualquier servidor WebSocket que entienda el mismo protocolo
 
+// ─── Constantes públicas ──────────────────────────────────────────────────────
+
+/** Ruta WebSocket estándar del servidor Voxtral Realtime. */
+export const VOXTRAL_WS_PATH = '/ws/stt-realtime';
+
 // ─── MicrophoneCapture ────────────────────────────────────────────────────────
 
 /**
