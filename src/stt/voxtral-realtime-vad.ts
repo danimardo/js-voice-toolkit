@@ -28,7 +28,7 @@ const DEFAULT_HESITATION_PHRASES = [
 
 // Conectores al final de frase que indican continuación
 const OPEN_CONNECTOR_RE =
-  /\b(y|pero|porque|que|si|cuando|aunque|o|ni|como|además|también|sin embargo|es decir|o sea|o sea que|y también|y además)\s*[.,]?\s*$/i;
+  /(?:^|\s)(y|pero|porque|que|si|cuando|aunque|o|ni|como|además|también|sin embargo|es decir|o sea|o sea que|y también|y además)\s*[.,]?\s*$/i;
 
 // Signos de puntuación de cierre
 const CLOSED_ENDING_RE = /[.!?¡¿]\s*$/;
@@ -36,7 +36,20 @@ const CLOSED_ENDING_RE = /[.!?¡¿]\s*$/;
 // Adjetivos/determinantes al final de frase que anticipan un sustantivo o número pendiente.
 // Ej: "correos de las últimas" → el usuario aún no ha dicho "24 horas".
 const HANGING_ADJECTIVE_RE =
-  /\b(últimas?|primeras?|próximas?|pasadas?|siguientes?|anteriores?|recientes?|nuevas?|viejas?|importantes?|urgentes?|pendientes?|no leídos?|leídos?|enviados?|recibidos?)\s*$/i;
+  /(?:^|\s)(últim[oa]s?|primer[oa]s?|próxim[oa]s?|pasad[oa]s?|siguientes?|anteriores?|recientes?|nuev[oa]s?|viej[oa]s?|importantes?|urgentes?|pendientes?|no leíd[oa]s?|leíd[oa]s?|enviad[oa]s?|recibid[oa]s?)\s*$/i;
+
+// Preposiciones/artículos al final de frase que casi siempre implican continuación.
+// Ej: "resumen de", "correos de las".
+const HANGING_PREPOSITION_RE =
+  /(?:^|\s)(de|del|para|por|con|sin|sobre|entre|hacia|hasta|desde|según|en|a|al)\s*$/i;
+
+const HANGING_ARTICLE_RE =
+  /(?:^|\s)(el|la|los|las|un|una|unos|unas|mi|mis|tu|tus|su|sus|este|esta|estos|estas|ese|esa|esos|esas)\s*$/i;
+
+// Verbos copulativos/transitivos al final de frase que claramente esperan un complemento.
+// Ej: "la dirección es", "el correo está", "se llama", "quiero que sea".
+const HANGING_VERB_RE =
+  /(?:^|\s)(es|está|son|están|era|eran|fue|fueron|será|serán|tiene|tienen|tenía|tenían|quiere|quieren|necesita|necesitan|llama|llaman|se\s+llama|llegan?|va|van|hace|hacen|dice|dicen)\s*$/i;
 
 // ─── Tipos públicos ───────────────────────────────────────────────────────────
 
@@ -74,6 +87,12 @@ export interface RealtimeSTTVADOptions {
    * Por defecto: 300ms.
    */
   minSpeechMs?: number;
+  /**
+   * Si es true, emite logs de diagnóstico del VAD en consola:
+   * RMS, umbral efectivo, cambios de estado y temporizadores.
+   * Por defecto: false.
+   */
+  debugVad?: boolean;
 
   // ─── Semántica ───────────────────────────────────────────────────────────────
   /**
@@ -82,6 +101,13 @@ export interface RealtimeSTTVADOptions {
    * Por defecto: ['eh', 'mmm', 'o sea', 'bueno', 'pues', 'y...', ...]
    */
   hesitationPhrases?: string[];
+  /**
+   * Si es true, usa heurísticas semánticas para extender el cierre de turno
+   * cuando la frase parece abierta ("de", "las últimas", "y...", etc.).
+   * Si es false, el cierre depende solo de pausas/inactividad de transcripción.
+   * Por defecto: true.
+   */
+  semanticTurnDetection?: boolean;
 
   // ─── Callbacks ───────────────────────────────────────────────────────────────
   /**
@@ -147,7 +173,13 @@ function classifyTurnEnd(text: string, hesitationPhrases: string[]): TurnClassif
   // 4. Adjetivo/determinante colgante que espera un sustantivo o número
   if (HANGING_ADJECTIVE_RE.test(lower)) return 'hesitate';
 
-  // 5. Ambiguo → tratar como cierre (el timer base ya sirve de buffer)
+  // 5. Preposición o artículo final: la frase sigue abierta
+  if (HANGING_PREPOSITION_RE.test(lower) || HANGING_ARTICLE_RE.test(lower)) return 'hesitate';
+
+  // 6. Verbo copulativo/transitivo final que espera un complemento
+  if (HANGING_VERB_RE.test(lower)) return 'hesitate';
+
+  // 7. Ambiguo → tratar como cierre (el timer base ya sirve de buffer)
   return 'close';
 }
 
@@ -191,7 +223,9 @@ export async function transcribeLiveRealtimeVAD(
     silenceThresholdMs = 700,
     silenceExtensionMs = 1500,
     minSpeechMs = 300,
+    debugVad = false,
     hesitationPhrases = DEFAULT_HESITATION_PHRASES,
+    semanticTurnDetection = true,
     onTranscript,
     onTurnEnd,
     onStart,
@@ -221,12 +255,23 @@ export async function transcribeLiveRealtimeVAD(
   let voiceActive = false;
   let firstSpeechTime = 0;         // Inicio de la sesión de voz actual (no se resetea por ruido)
   let consecutiveVoiceChunks = 0;  // Chunks de voz consecutivos para confirmar habla real
+  let consecutiveSilentChunks = 0; // Chunks de silencio consecutivos para confirmar pausa real
   let silenceTimer: ReturnType<typeof setTimeout> | null = null;
+  let transcriptIdleTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Chunks consecutivos de voz necesarios para confirmar habla real.
   // 2 chunks × ~128ms = ~256ms. Evita que picos breves de ruido ambiente
   // cancelen el timer de silencio o disparen onVoiceStart erróneamente.
   const VOICE_CONFIRM_CHUNKS = 2;
+  // 4 chunks × ~128ms = ~512ms de silencio continuo antes de confirmar VOICE_PAUSE.
+  // Con 2 (256ms) se detectaban pausas naturales de coma o respiración como fin de voz.
+  const SILENCE_CONFIRM_CHUNKS = 4;
+
+  // Histéresis: para re-activar la voz durante el período de silencio (y cancelar
+  // el timer) se exige SILENCE_HYSTERESIS × effectiveThreshold de energía.
+  // Evita que ruido ambiente justo por encima del umbral cancele el timer.
+  // Valor 2 → el ruido necesita ser 2× más fuerte que el umbral para cancelar.
+  const SILENCE_HYSTERESIS = 2.0;
 
   // ─── Calibración automática de ruido ambiente (en paralelo con el VAD) ──────
   // Rastrea el mínimo RMS visto en los primeros CALIB_CHUNKS chunks. Después
@@ -236,8 +281,15 @@ export async function transcribeLiveRealtimeVAD(
   let calibrationDone = false;
   let calibChunkCount = 0;
   let calibRmsMin = Infinity;
+  let calibQuietChunks = 0;
   const CALIB_CHUNKS = 30; // 30 × 128ms ≈ 4 segundos
+  const MIN_CALIB_QUIET_CHUNKS = 6; // ~768ms de silencio/ruido real antes de recalibrar
   let effectiveThreshold = vadEnergyThreshold;
+  let chunkIndex = 0;
+
+  const debugLog = (message: string): void => {
+    if (debugVad) console.log(`[VAD debug] ${message}`);
+  };
 
   const handleError = (err: Error): void => {
     if (onError) onError(err);
@@ -263,15 +315,26 @@ export async function transcribeLiveRealtimeVAD(
 
   function cancelSilenceTimer(): void {
     if (silenceTimer !== null) {
+      debugLog('Cancelando silenceTimer');
       clearTimeout(silenceTimer);
       silenceTimer = null;
     }
   }
 
+  function cancelTranscriptIdleTimer(): void {
+    if (transcriptIdleTimer !== null) {
+      debugLog('Cancelando transcriptIdleTimer');
+      clearTimeout(transcriptIdleTimer);
+      transcriptIdleTimer = null;
+    }
+  }
+
   function fireTurnEnd(): void {
     cancelSilenceTimer();
+    cancelTranscriptIdleTimer();
     if (!active) return;
     const text = turnText.trim();
+    debugLog(`fireTurnEnd(textLength=${text.length}, pendingTurnEnd=${pendingTurnEnd}, voiceActive=${voiceActive})`);
 
     if (!text) {
       // La transcripción de Mistral aún no ha llegado (latencia de red).
@@ -293,11 +356,15 @@ export async function transcribeLiveRealtimeVAD(
   function scheduleSilenceTimer(extended: boolean): void {
     cancelSilenceTimer();
     const delay = extended ? silenceThresholdMs + silenceExtensionMs : silenceThresholdMs;
+    debugLog(`Programando silenceTimer(delay=${delay}ms, extended=${extended}, text="${turnText.trim()}")`);
     silenceTimer = setTimeout(() => {
       silenceTimer = null;
       if (!active) return;
 
-      const classification = classifyTurnEnd(turnText, hesitationPhrases);
+      const classification = semanticTurnDetection
+        ? classifyTurnEnd(turnText, hesitationPhrases)
+        : 'close';
+      debugLog(`Silence timer expiró(classification=${classification}, extended=${extended}, text="${turnText.trim()}")`);
 
       if (classification === 'hesitate' && !extended) {
         // Primera evaluación: duda detectada → esperar más
@@ -309,10 +376,32 @@ export async function transcribeLiveRealtimeVAD(
     }, delay);
   }
 
+  function scheduleTranscriptIdleTimer(): void {
+    cancelTranscriptIdleTimer();
+    const delay = silenceThresholdMs;
+    debugLog(`Programando transcriptIdleTimer(delay=${delay}ms, text="${turnText.trim()}")`);
+    transcriptIdleTimer = setTimeout(() => {
+      transcriptIdleTimer = null;
+      if (!active || voiceActive || silenceTimer !== null) return;
+
+      const classification = semanticTurnDetection
+        ? classifyTurnEnd(turnText, hesitationPhrases)
+        : 'close';
+      debugLog(`Transcript idle expiró(classification=${classification}, text="${turnText.trim()}")`);
+
+      if (classification === 'hesitate') {
+        scheduleSilenceTimer(true);
+      } else {
+        fireTurnEnd();
+      }
+    }, delay);
+  }
+
   // ─── VAD: analizar cada chunk de audio ─────────────────────────────────────
 
   function processAudioChunk(chunk: Int16Array): void {
     const rms = calculateRMS(chunk);
+    chunkIndex++;
 
     // ── Calibración en paralelo (no bloquea el VAD) ───────────────────────────
     // Rastrea el mínimo RMS durante los primeros ~4 segundos. El mínimo es
@@ -320,44 +409,81 @@ export async function transcribeLiveRealtimeVAD(
     // las pausas inter-silábicas y entre palabras dan valores cercanos al ruido real.
     if (!calibrationDone) {
       calibChunkCount++;
-      if (rms < calibRmsMin) calibRmsMin = rms;
+      if (rms < vadEnergyThreshold) {
+        calibQuietChunks++;
+        if (rms < calibRmsMin) calibRmsMin = rms;
+      }
       if (calibChunkCount >= CALIB_CHUNKS) {
         calibrationDone = true;
-        const newThreshold = Math.max(vadEnergyThreshold, calibRmsMin * 3);
-        if (newThreshold > effectiveThreshold) {
-          effectiveThreshold = newThreshold;
-          console.debug(
-            `[VAD] Calibración — mínimo RMS: ${calibRmsMin.toFixed(4)}, umbral ajustado: ${effectiveThreshold.toFixed(4)}`
+        if (calibQuietChunks >= MIN_CALIB_QUIET_CHUNKS && Number.isFinite(calibRmsMin)) {
+          const newThreshold = Math.max(vadEnergyThreshold, calibRmsMin * 3);
+          if (newThreshold > effectiveThreshold) {
+            effectiveThreshold = newThreshold;
+            debugLog(
+              `Calibración aplicada(minRms=${calibRmsMin.toFixed(4)}, quietChunks=${calibQuietChunks}, threshold=${effectiveThreshold.toFixed(4)})`
+            );
+          }
+        } else {
+          debugLog(
+            `Calibración omitida(quietChunks=${calibQuietChunks}/${MIN_CALIB_QUIET_CHUNKS}, threshold=${effectiveThreshold.toFixed(4)})`
           );
         }
       }
     }
 
-    if (rms >= effectiveThreshold) {
+    // Histéresis: durante el período de silencio (timer activo o voiceActive=false)
+    // se exige más energía para re-activar la voz que para desactivarla.
+    // Esto evita que el ruido ambiente (que está justo por encima del umbral)
+    // cancele el timer de silencio repetidamente.
+    const voiceOnThreshold = voiceActive
+      ? effectiveThreshold                        // voz activa → umbral normal para detectar silencio
+      : effectiveThreshold * SILENCE_HYSTERESIS;  // silencio → umbral 2× para re-activar voz
+
+    if (debugVad && (chunkIndex <= 12 || chunkIndex % 10 === 0)) {
+      debugLog(
+        `chunk=${chunkIndex} rms=${rms.toFixed(4)} threshold=${effectiveThreshold.toFixed(4)} voiceOnThreshold=${voiceOnThreshold.toFixed(4)} voiceActive=${voiceActive} silenceTimer=${silenceTimer !== null}`
+      );
+    }
+
+    if (rms >= voiceOnThreshold) {
       // ── Energía de voz detectada ──
       consecutiveVoiceChunks++;
+      consecutiveSilentChunks = 0;
 
       if (!voiceActive && consecutiveVoiceChunks >= VOICE_CONFIRM_CHUNKS) {
-        // Solo se confirma habla real tras N chunks consecutivos.
-        // Evita que un pico de ruido aislado active el VAD o cancele el timer.
+        // Solo se confirma habla real tras N chunks consecutivos con energía 2×.
+        // Evita que ruido ambiente cancele el timer de silencio.
         voiceActive = true;
+        consecutiveSilentChunks = 0;
         if (firstSpeechTime === 0) firstSpeechTime = Date.now();
         pendingTurnEnd = false; // El usuario volvió a hablar antes de recibir la transcripción
         cancelSilenceTimer();   // Habla real confirmada → cancelar timer de silencio
+        cancelTranscriptIdleTimer();
+        debugLog(`VOICE_START(chunk=${chunkIndex}, rms=${rms.toFixed(4)}, speechStart=${firstSpeechTime})`);
         onVoiceStart?.();
       }
     } else {
       // ── Silencio detectado ──
       consecutiveVoiceChunks = 0;
+      consecutiveSilentChunks++;
 
       if (voiceActive) {
+        if (consecutiveSilentChunks < SILENCE_CONFIRM_CHUNKS) {
+          debugLog(`Silencio candidato(chunk=${chunkIndex}, rms=${rms.toFixed(4)}, count=${consecutiveSilentChunks}/${SILENCE_CONFIRM_CHUNKS})`);
+          return;
+        }
+
         voiceActive = false;
         const speechDuration = Date.now() - firstSpeechTime;
+        debugLog(`VOICE_PAUSE(chunk=${chunkIndex}, rms=${rms.toFixed(4)}, speechDuration=${speechDuration}ms)`);
 
         if (speechDuration >= minSpeechMs) {
           // Suficiente habla acumulada → activar timer de fin de turno
           onVoicePause?.();
           scheduleSilenceTimer(false);
+        }
+        else {
+          debugLog(`Silencio ignorado por minSpeechMs(speechDuration=${speechDuration}ms, min=${minSpeechMs}ms)`);
         }
         // Si la voz fue demasiado corta → ignorar (firstSpeechTime se mantiene para el siguiente chunk)
       }
@@ -392,12 +518,26 @@ export async function transcribeLiveRealtimeVAD(
     } else if (data.type === 'delta' && data.text) {
       if (!ignoreDeltas) {
         turnText += data.text;
+        debugLog(`delta="${data.text}" accumulated="${turnText}"`);
         onTranscript(data.text, turnText);
 
+        if (!voiceActive && silenceTimer === null) {
+          scheduleTranscriptIdleTimer();
+        } else if (!voiceActive && silenceTimer !== null) {
+          // Nueva transcripción llega mientras el silenceTimer está corriendo:
+          // el usuario sigue hablando (Mistral lo confirma). Resetear el timer
+          // para que no dispare prematuramente antes de que Mistral termine.
+          debugLog(`Silencio pospuesto por nueva transcripción: "${turnText.trim()}"`);
+          scheduleSilenceTimer(false);
+        }
+
         // El timer disparó cuando turnText estaba vacío (latencia Mistral).
-        // Ahora que llegó texto y el VAD confirma silencio, disparar de inmediato.
+        // Ahora que llegó texto, no disparar con el primer delta: esperar
+        // inactividad breve de transcripción para evitar fragmentos como "die" o ".com".
         if (pendingTurnEnd && !voiceActive && silenceTimer === null) {
-          fireTurnEnd();
+          pendingTurnEnd = false;
+          debugLog('pendingTurnEnd resuelto con delta tardío; esperando transcript idle');
+          scheduleTranscriptIdleTimer();
         }
       }
     } else if (data.type === 'done') {
@@ -412,6 +552,7 @@ export async function transcribeLiveRealtimeVAD(
     if (active) {
       active = false;
       cancelSilenceTimer();
+      cancelTranscriptIdleTimer();
       cleanup();
       onStop?.();
     }
@@ -428,6 +569,7 @@ export async function transcribeLiveRealtimeVAD(
       if (!active) return;
       active = false;
       cancelSilenceTimer();
+      cancelTranscriptIdleTimer();
       mic?.stop();
       mic = null;
       if (ws && ws.readyState === WebSocket.OPEN) {
